@@ -414,10 +414,11 @@ jobs:
       - name: Trigger infra image update
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
         run: |
-          COMMIT_MSG=$(echo "${{ github.event.head_commit.message }}" | head -n1)
+          FIRST_LINE=$(echo "$COMMIT_MSG" | head -n1)
           gh workflow run update-image.yml \
             --repo theopenco/llmgateway-infra \
             -f repository="${{ github.repository }}" \
             -f git_sha="${{ needs.setup.outputs.short_sha }}" \
-            -f commit_message="$COMMIT_MSG"
+            -f commit_message="$FIRST_LINE"
