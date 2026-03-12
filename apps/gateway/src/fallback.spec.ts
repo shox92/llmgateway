@@ -1,5 +1,6 @@
 import {
 	afterAll,
+	afterEach,
 	beforeEach,
 	beforeAll,
 	describe,
@@ -8,7 +9,7 @@ import {
 	vi,
 } from "vitest";
 
-import { db, tables, type Log } from "@llmgateway/db";
+import { and, db, eq, tables, type Log } from "@llmgateway/db";
 
 import { app } from "./app.js";
 import {
@@ -21,19 +22,13 @@ import { clearCache, waitForLogs, readAll } from "./test-utils/test-helpers.js";
 describe("fallback and error status code handling", () => {
 	let mockServerUrl: string;
 
-	beforeAll(() => {
-		mockServerUrl = startMockServer(3001);
-	});
-
-	afterAll(() => {
-		stopMockServer();
-	});
-
-	beforeEach(async () => {
+	async function resetTestState() {
+		resetFailOnceCounter();
 		await clearCache();
 
 		await Promise.all([
 			db.delete(tables.log),
+			db.delete(tables.apiKeyIamRule),
 			db.delete(tables.apiKey),
 			db.delete(tables.providerKey),
 		]);
@@ -50,6 +45,18 @@ describe("fallback and error status code handling", () => {
 			db.delete(tables.session),
 			db.delete(tables.verification),
 		]);
+	}
+
+	beforeAll(() => {
+		mockServerUrl = startMockServer(3001);
+	});
+
+	afterAll(() => {
+		stopMockServer();
+	});
+
+	beforeEach(async () => {
+		await resetTestState();
 	});
 
 	beforeEach(async () => {
@@ -80,6 +87,10 @@ describe("fallback and error status code handling", () => {
 			organizationId: "org-id",
 			mode: "api-keys",
 		});
+	});
+
+	afterEach(async () => {
+		await resetTestState();
 	});
 
 	// Helper to set up API key and provider key
@@ -118,6 +129,72 @@ describe("fallback and error status code handling", () => {
 			organizationId: "org-id",
 			baseUrl: mockServerUrl,
 		});
+	}
+
+	async function setupMultiProviderKeys() {
+		await db.insert(tables.apiKey).values({
+			id: "token-id",
+			token: "real-token",
+			projectId: "project-id",
+			description: "Test API Key",
+			createdBy: "user-id",
+		});
+
+		await db.insert(tables.providerKey).values([
+			{
+				id: "provider-key-together",
+				token: "sk-together-key",
+				provider: "together.ai",
+				organizationId: "org-id",
+				baseUrl: mockServerUrl,
+			},
+			{
+				id: "provider-key-cerebras",
+				token: "sk-cerebras-key",
+				provider: "cerebras",
+				organizationId: "org-id",
+				baseUrl: mockServerUrl,
+			},
+		]);
+	}
+
+	async function setRoutingMetrics(
+		modelId: string,
+		providerId: string,
+		routingUptime: number,
+	) {
+		await db
+			.update(tables.modelProviderMapping)
+			.set({
+				routingUptime,
+				routingLatency: 100,
+				routingThroughput: 100,
+				routingTotalRequests: 100,
+			})
+			.where(
+				and(
+					eq(tables.modelProviderMapping.modelId, modelId),
+					eq(tables.modelProviderMapping.providerId, providerId),
+				),
+			);
+	}
+
+	async function insertIamRules(
+		rules: Array<{
+			id: string;
+			ruleType: "allow_providers" | "deny_providers";
+			providers: string[];
+		}>,
+	) {
+		await db.insert(tables.apiKeyIamRule).values(
+			rules.map((rule) => ({
+				id: rule.id,
+				apiKeyId: "token-id",
+				ruleType: rule.ruleType,
+				ruleValue: { providers: rule.providers },
+				status: "active" as const,
+			})),
+		);
 	}
 
 	describe("error status code classification", () => {
@@ -581,6 +658,124 @@ describe("fallback and error status code handling", () => {
 		});
 	});
 
+	describe("low-uptime fallback respects IAM provider rules", () => {
+		const modelId = "llama-3.1-8b-instruct";
+
+		beforeEach(async () => {
+			await setupMultiProviderKeys();
+			await setRoutingMetrics(modelId, "together.ai", 0);
+			await setRoutingMetrics(modelId, "cerebras", 100);
+		});
+
+		test("does not reroute a 0% uptime provider when IAM only allows the requested provider", async () => {
+			await insertIamRules([
+				{
+					id: "iam-allow-together",
+					ruleType: "allow_providers",
+					providers: ["together.ai"],
+				},
+			]);
+
+			const res = await app.request("/v1/chat/completions", {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Authorization: "Bearer real-token",
+				},
+				body: JSON.stringify({
+					model: "together.ai/llama-3.1-8b-instruct",
+					messages: [{ role: "user", content: "Hello!" }],
+				}),
+			});
+
+			expect(res.status).toBe(200);
+			const json = await res.json();
+			expect(json.metadata.used_provider).toBe("together.ai");
+			expect(json.metadata.requested_provider).toBe("together.ai");
+
+			const logs = await waitForLogs(1);
+			expect(logs).toHaveLength(1);
+			expect(logs[0].usedProvider).toBe("together.ai");
+			expect(logs[0].routingMetadata?.selectedProvider).toBe("together.ai");
+			expect(logs[0].routingMetadata?.selectionReason).not.toBe(
+				"low-uptime-fallback",
+			);
+		});
+
+		test("does not reroute a 0% uptime provider when IAM denies the fallback provider", async () => {
+			await insertIamRules([
+				{
+					id: "iam-deny-cerebras",
+					ruleType: "deny_providers",
+					providers: ["cerebras"],
+				},
+			]);
+
+			const res = await app.request("/v1/chat/completions", {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Authorization: "Bearer real-token",
+				},
+				body: JSON.stringify({
+					model: "together.ai/llama-3.1-8b-instruct",
+					messages: [{ role: "user", content: "Hello!" }],
+				}),
+			});
+
+			expect(res.status).toBe(200);
+			const json = await res.json();
+			expect(json.metadata.used_provider).toBe("together.ai");
+
+			const logs = await waitForLogs(1);
+			expect(logs).toHaveLength(1);
+			expect(logs[0].usedProvider).toBe("together.ai");
+			expect(logs[0].routingMetadata?.selectedProvider).toBe("together.ai");
+			expect(logs[0].routingMetadata?.selectionReason).not.toBe(
+				"low-uptime-fallback",
+			);
+		});
+
+		test("does not reroute a 0% uptime provider when IAM both allows one provider and denies the rest", async () => {
+			await insertIamRules([
+				{
+					id: "iam-allow-together-combo",
+					ruleType: "allow_providers",
+					providers: ["together.ai"],
+				},
+				{
+					id: "iam-deny-cerebras-combo",
+					ruleType: "deny_providers",
+					providers: ["cerebras"],
+				},
+			]);
+
+			const res = await app.request("/v1/chat/completions", {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Authorization: "Bearer real-token",
+				},
+				body: JSON.stringify({
+					model: "together.ai/llama-3.1-8b-instruct",
+					messages: [{ role: "user", content: "Hello!" }],
+				}),
+			});
+
+			expect(res.status).toBe(200);
+			const json = await res.json();
+			expect(json.metadata.used_provider).toBe("together.ai");
+
+			const logs = await waitForLogs(1);
+			expect(logs).toHaveLength(1);
+			expect(logs[0].usedProvider).toBe("together.ai");
+			expect(logs[0].routingMetadata?.selectedProvider).toBe("together.ai");
+			expect(logs[0].routingMetadata?.selectionReason).not.toBe(
+				"low-uptime-fallback",
+			);
+		});
+	});
+
 	describe("routing metadata in DB log entries", () => {
 		test("successful request stores routing metadata with selection reason in DB log", async () => {
 			await setupKeys("openai");
@@ -759,40 +954,6 @@ describe("fallback and error status code handling", () => {
 	});
 
 	describe("retry with fallback to alternate provider", () => {
-		// Helper to set up two provider keys for retry testing
-		// Uses together.ai and cerebras which both support llama-3.1-8b-instruct
-		// and use the OpenAI-compatible /v1/chat/completions endpoint
-		async function setupMultiProviderKeys() {
-			await db.insert(tables.apiKey).values({
-				id: "token-id",
-				token: "real-token",
-				projectId: "project-id",
-				description: "Test API Key",
-				createdBy: "user-id",
-			});
-
-			await db.insert(tables.providerKey).values([
-				{
-					id: "provider-key-together",
-					token: "sk-together-key",
-					provider: "together.ai",
-					organizationId: "org-id",
-					baseUrl: mockServerUrl,
-				},
-				{
-					id: "provider-key-cerebras",
-					token: "sk-cerebras-key",
-					provider: "cerebras",
-					organizationId: "org-id",
-					baseUrl: mockServerUrl,
-				},
-			]);
-		}
-
-		beforeEach(() => {
-			resetFailOnceCounter();
-		});
-
 		test("non-streaming: retries on 500 and succeeds on fallback provider with failed_attempts in metadata", async () => {
 			await setupMultiProviderKeys();
 
@@ -994,6 +1155,101 @@ describe("fallback and error status code handling", () => {
 			expect(failedLog).toBeDefined();
 			expect(failedLog!.retried).toBe(true);
 			expect(failedLog!.retriedByLogId).toBe(successLog!.id);
+		});
+
+		test("non-streaming: IAM allow_providers prevents retry fallback to a different provider", async () => {
+			await setupMultiProviderKeys();
+			await insertIamRules([
+				{
+					id: "iam-retry-allow-together",
+					ruleType: "allow_providers",
+					providers: ["together.ai"],
+				},
+			]);
+
+			const res = await app.request("/v1/chat/completions", {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Authorization: "Bearer real-token",
+				},
+				body: JSON.stringify({
+					model: "llama-3.1-8b-instruct",
+					messages: [{ role: "user", content: "TRIGGER_FAIL_ONCE hello" }],
+				}),
+			});
+
+			expect(res.status).toBe(502);
+
+			const logs = await waitForLogs(1);
+			expect(logs).toHaveLength(1);
+			expect(logs[0].usedProvider).toBe("together.ai");
+			expect(logs.some((log) => log.usedProvider === "cerebras")).toBe(false);
+		});
+
+		test("non-streaming: IAM deny_providers prevents retry fallback to a denied provider", async () => {
+			await setupMultiProviderKeys();
+			await insertIamRules([
+				{
+					id: "iam-retry-deny-cerebras",
+					ruleType: "deny_providers",
+					providers: ["cerebras"],
+				},
+			]);
+
+			const res = await app.request("/v1/chat/completions", {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Authorization: "Bearer real-token",
+				},
+				body: JSON.stringify({
+					model: "llama-3.1-8b-instruct",
+					messages: [{ role: "user", content: "TRIGGER_FAIL_ONCE hello" }],
+				}),
+			});
+
+			expect(res.status).toBe(500);
+
+			const logs = await waitForLogs(1);
+			expect(logs).toHaveLength(1);
+			expect(logs[0].usedProvider).toBe("together.ai");
+			expect(logs.some((log) => log.usedProvider === "cerebras")).toBe(false);
+		});
+
+		test("non-streaming: combined IAM allow and deny rules prevent retry fallback to any disallowed provider", async () => {
+			await setupMultiProviderKeys();
+			await insertIamRules([
+				{
+					id: "iam-retry-allow-together-combo",
+					ruleType: "allow_providers",
+					providers: ["together.ai"],
+				},
+				{
+					id: "iam-retry-deny-cerebras-combo",
+					ruleType: "deny_providers",
+					providers: ["cerebras"],
+				},
+			]);
+
+			const res = await app.request("/v1/chat/completions", {
+				method: "POST",
+				headers: {
+					"Content-Type": "application/json",
+					Authorization: "Bearer real-token",
+				},
+				body: JSON.stringify({
+					model: "llama-3.1-8b-instruct",
+					messages: [{ role: "user", content: "TRIGGER_FAIL_ONCE hello" }],
+				}),
+			});
+
+			expect(res.status).toBe(502);
+
+			const logs = await waitForLogs(1);
+			expect(logs).toHaveLength(1);
+			expect(logs[0].usedProvider).toBe("together.ai");
+			expect(logs.some((log) => log.usedProvider === "cerebras")).toBe(false);
 		});
 	});
 });
